@@ -50,17 +50,29 @@ class PPOAlgo(BaseAlgo):
                 # Initialize memory
 
                 if self.acmodel.recurrent:
-                    memory = exps.memory[inds]
+                    if not self.acmodel.use_dnc_memory:
+                        memory = exps.memory[inds]
+                    else:
+                        memory_tuples = [exps.memory[i] for i in inds]
+                        controller_hidden_batch = torch.cat([memory_tuple[0] for memory_tuple in memory_tuples],dim=3)
+                        controller_hidden = [torch.unbind(x) for x in torch.unbind(controller_hidden_batch)]
+                        memory_batch = {}
+                        for key in memory_tuples[0][1]:
+                            memory_batch[key] = torch.stack([memory_tuple[1][key] for memory_tuple in memory_tuples])
+                        read_vectors_batch = torch.stack([memory_tuple[2] for memory_tuple in memory_tuples])
+                        memory = (controller_hidden,memory_batch,read_vectors_batch)
 
                 for i in range(self.recurrence):
                     # Create a sub-batch of experience
-
                     sb = exps[inds + i]
 
                     # Compute loss
 
                     if self.acmodel.recurrent:
-                        dist, value, memory = self.acmodel(sb.obs, memory * sb.mask)
+                        if self.acmodel.use_dnc_memory:
+                            dist, value, memory = self.acmodel(sb.obs, memory)
+                        else:
+                            dist, value, memory = self.acmodel(sb.obs, memory * sb.mask)
                     else:
                         dist, value = self.acmodel(sb.obs)
 
@@ -89,7 +101,22 @@ class PPOAlgo(BaseAlgo):
                     # Update memories for next epoch
 
                     if self.acmodel.recurrent and i < self.recurrence - 1:
-                        exps.memory[inds + i + 1] = memory.detach()
+                        if not self.acmodel.use_dnc_memory:
+                            exps.memory[inds + i + 1] = memory.detach()
+                        else:
+                            inner_hiddens = []
+                            for j in range(len(memory[0])):
+                                inner_hiddens.append(torch.stack(memory[0][j]))
+                            controller_hiddens = torch.stack(inner_hiddens)
+                            for k in range(len(inds)):
+                                new_memory = {}
+                                for key in memory[1]:
+                                    new_memory[key] = memory[1][key][k].detach()
+                                new_read_vectors = memory[2][k].detach()
+
+                                exps.memory[inds[k] + i + 1] = (controller_hiddens[:,:,:,k:k+1,:].detach(),
+                                                                         new_memory,
+                                                                         new_read_vectors)
 
                 # Update batch values
 
@@ -140,7 +167,6 @@ class PPOAlgo(BaseAlgo):
         batches_starting_indexes : list of list of int
             the indexes of the experiences to be used at first for each batch
         """
-
         indexes = numpy.arange(0, self.num_frames, self.recurrence)
         indexes = numpy.random.permutation(indexes)
 

@@ -83,6 +83,9 @@ class BaseAlgo(ABC):
         if self.acmodel.recurrent:
             self.memory = torch.zeros(shape[1], self.acmodel.memory_size, device=self.device)
             self.memories = torch.zeros(*shape, self.acmodel.memory_size, device=self.device)
+        if self.acmodel.use_dnc_memory:
+            self.dnc_memories = [None]*(self.num_frames_per_proc*self.num_procs)
+            self.dnc_memory = (None,None,None)
         self.mask = torch.ones(shape[1], device=self.device)
         self.masks = torch.zeros(*shape, device=self.device)
         self.actions = torch.zeros(*shape, device=self.device, dtype=torch.int)
@@ -129,7 +132,10 @@ class BaseAlgo(ABC):
             preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
             with torch.no_grad():
                 if self.acmodel.recurrent:
-                    dist, value, memory = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
+                    if self.acmodel.use_dnc_memory:
+                        dist, value, memory = self.acmodel(preprocessed_obs, self.dnc_memory)
+                    else:
+                        dist, value, memory = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
                 else:
                     dist, value = self.acmodel(preprocessed_obs)
             action = dist.sample()
@@ -141,8 +147,26 @@ class BaseAlgo(ABC):
             self.obss[i] = self.obs
             self.obs = obs
             if self.acmodel.recurrent:
-                self.memories[i] = self.memory
-                self.memory = memory
+                if self.acmodel.use_dnc_memory:
+                    inner_hiddens = []
+                    for j in range(len(memory[0])):
+                        inner_hiddens.append(torch.stack(memory[0][j]))
+                    controller_hiddens = torch.stack(inner_hiddens)
+
+                    for y in range(8):
+                        new_memory = {}
+                        for key in memory[1]:
+                            new_memory[key] = memory[1][key][y]
+                        new_read_vectors = memory[2][y]
+
+                        self.dnc_memories[i*self.num_procs+y] = (controller_hiddens[:,:,:,y:y+1,:],
+                                                                 new_memory,
+                                                                 new_read_vectors)
+                    self.dnc_memory = memory
+                else:
+                    self.memories[i] = self.memory
+                    self.memory = memory
+
             self.masks[i] = self.mask
             self.mask = 1 - torch.tensor(done, device=self.device, dtype=torch.float)
             self.actions[i] = action
@@ -178,7 +202,10 @@ class BaseAlgo(ABC):
         preprocessed_obs = self.preprocess_obss(self.obs, device=self.device)
         with torch.no_grad():
             if self.acmodel.recurrent:
-                _, next_value, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
+                if self.acmodel.use_dnc_memory:
+                    _, next_value, _ = self.acmodel(preprocessed_obs, self.dnc_memory)
+                else:
+                    _, next_value, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
             else:
                 _, next_value = self.acmodel(preprocessed_obs)
 
@@ -203,10 +230,13 @@ class BaseAlgo(ABC):
                     for j in range(self.num_procs)
                     for i in range(self.num_frames_per_proc)]
         if self.acmodel.recurrent:
-            # T x P x D -> P x T x D -> (P * T) x D
-            exps.memory = self.memories.transpose(0, 1).reshape(-1, *self.memories.shape[2:])
-            # T x P -> P x T -> (P * T) x 1
-            exps.mask = self.masks.transpose(0, 1).reshape(-1).unsqueeze(1)
+            if self.acmodel.use_dnc_memory:
+                exps.memory = self.dnc_memories
+            else:
+                # T x P x D -> P x T x D -> (P * T) x D
+                exps.memory = self.memories.transpose(0, 1).reshape(-1, *self.memories.shape[2:])
+                # T x P -> P x T -> (P * T) x 1
+                exps.mask = self.masks.transpose(0, 1).reshape(-1).unsqueeze(1)
         # for all tensors below, T x P -> P x T -> P * T
         exps.action = self.actions.transpose(0, 1).reshape(-1)
         exps.value = self.values.transpose(0, 1).reshape(-1)
