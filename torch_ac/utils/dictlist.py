@@ -17,7 +17,13 @@ class DictList(dict):
         return len(next(iter(dict.values(self))))
 
     def __getitem__(self, index):
-        return DictList({key: value[index] for key, value in dict.items(self)})
+        res_dict = {}
+        for key, value in dict.items(self):
+            if type(value)==list and type(index)!=int:
+                res_dict[key] = [value[i] for i in index]
+            else:
+                res_dict[key] = value[index]
+        return DictList(res_dict)
 
     def __setitem__(self, index, d):
         for key, value in d.items():

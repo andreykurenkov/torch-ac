@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 import torch
 
+import numpy
 from torch_ac.format import default_preprocess_obss
 from torch_ac.utils import DictList, ParallelEnv
 
@@ -86,6 +87,9 @@ class BaseAlgo(ABC):
         if self.acmodel.use_dnc_memory:
             self.dnc_memories = [None]*(self.num_frames_per_proc*self.num_procs)
             self.dnc_memory = (None,None,None)
+        if self.acmodel.use_ntm_memory:
+            self.ntm_memory = self.acmodel.ntm.get_initial_state(shape[1])
+            self.ntm_memories =  [None]*(self.num_frames_per_proc*self.num_procs)
         self.mask = torch.ones(shape[1], device=self.device)
         self.masks = torch.zeros(*shape, device=self.device)
         self.actions = torch.zeros(*shape, device=self.device, dtype=torch.int)
@@ -134,12 +138,13 @@ class BaseAlgo(ABC):
                 if self.acmodel.recurrent:
                     if self.acmodel.use_dnc_memory:
                         dist, value, memory = self.acmodel(preprocessed_obs, self.dnc_memory)
+                    elif self.acmodel.use_ntm_memory:
+                        dist, value, memory = self.acmodel(preprocessed_obs, self.ntm_memory)
                     else:
                         dist, value, memory = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
                 else:
                     dist, value = self.acmodel(preprocessed_obs)
             action = dist.sample()
-
             obs, reward, done, _ = self.env.step(action.cpu().numpy())
 
             # Update experiences values
@@ -163,6 +168,9 @@ class BaseAlgo(ABC):
                                                                  new_memory,
                                                                  new_read_vectors)
                     self.dnc_memory = memory
+                elif self.acmodel.use_ntm_memory:
+                    self.ntm_memories[i] = self.ntm_memory
+                    self.ntm_memory = memory
                 else:
                     self.memories[i] = self.memory
                     self.memory = memory
@@ -204,6 +212,8 @@ class BaseAlgo(ABC):
             if self.acmodel.recurrent:
                 if self.acmodel.use_dnc_memory:
                     _, next_value, _ = self.acmodel(preprocessed_obs, self.dnc_memory)
+                elif self.acmodel.use_ntm_memory:
+                    _, next_value, _ = self.acmodel(preprocessed_obs, self.ntm_memory)
                 else:
                     _, next_value, _ = self.acmodel(preprocessed_obs, self.memory * self.mask.unsqueeze(1))
             else:
@@ -232,6 +242,8 @@ class BaseAlgo(ABC):
         if self.acmodel.recurrent:
             if self.acmodel.use_dnc_memory:
                 exps.memory = self.dnc_memories
+            elif self.acmodel.use_ntm_memory:
+                exps.memory = self.ntm_memories
             else:
                 # T x P x D -> P x T x D -> (P * T) x D
                 exps.memory = self.memories.transpose(0, 1).reshape(-1, *self.memories.shape[2:])

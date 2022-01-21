@@ -20,9 +20,10 @@ class PPOAlgo(BaseAlgo):
         self.clip_eps = clip_eps
         self.epochs = epochs
         self.batch_size = batch_size
+        torch.autograd.set_detect_anomaly(True)
 
         assert self.batch_size % self.recurrence == 0
-
+        #self.optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, self.acmodel.parameters()), lr, eps=adam_eps)
         self.optimizer = torch.optim.Adam(self.acmodel.parameters(), lr, eps=adam_eps)
         self.batch_num = 0
 
@@ -50,9 +51,7 @@ class PPOAlgo(BaseAlgo):
                 # Initialize memory
 
                 if self.acmodel.recurrent:
-                    if not self.acmodel.use_dnc_memory:
-                        memory = exps.memory[inds]
-                    else:
+                    if self.acmodel.use_dnc_memory:
                         memory_tuples = [exps.memory[i] for i in inds]
                         controller_hidden_batch = torch.cat([memory_tuple[0] for memory_tuple in memory_tuples],dim=3)
                         controller_hidden = [torch.unbind(x) for x in torch.unbind(controller_hidden_batch)]
@@ -61,62 +60,94 @@ class PPOAlgo(BaseAlgo):
                             memory_batch[key] = torch.stack([memory_tuple[1][key] for memory_tuple in memory_tuples])
                         read_vectors_batch = torch.stack([memory_tuple[2] for memory_tuple in memory_tuples])
                         memory = (controller_hidden,memory_batch,read_vectors_batch)
+                    else:
+                        memory = exps.memory
 
                 for i in range(self.recurrence):
                     # Create a sub-batch of experience
                     sb = exps[inds + i]
 
                     # Compute loss
+                    if self.acmodel.recurrent and self.acmodel.use_ntm_memory:
+                        for x in range(len(inds)):
+                            dist, value, memory = self.acmodel(torch.unsqueeze(sb.obs[x],0), sb.memory[x], True)
+                            entropy = dist.entropy().mean()
 
-                    if self.acmodel.recurrent:
-                        if self.acmodel.use_dnc_memory:
-                            dist, value, memory = self.acmodel(sb.obs, memory)
-                        else:
-                            dist, value, memory = self.acmodel(sb.obs, memory * sb.mask)
+                            ratio = torch.exp(dist.log_prob(sb.action) - sb.log_prob)
+                            surr1 = ratio * sb.advantage
+                            surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * sb.advantage
+                            policy_loss = -torch.min(surr1, surr2).mean()
+
+                            value_clipped = sb.value + torch.clamp(value - sb.value, -self.clip_eps, self.clip_eps)
+                            surr1 = (value - sb.returnn).pow(2)
+                            surr2 = (value_clipped - sb.returnn).pow(2)
+                            value_loss = torch.max(surr1, surr2).mean()
+
+                            loss = policy_loss - self.entropy_coef * entropy + self.value_loss_coef * value_loss
+
+                            # Update batch values
+
+                            batch_entropy += entropy.item()
+                            batch_value += value.mean().item()
+                            batch_policy_loss += policy_loss.item()
+                            batch_value_loss += value_loss.item()
+                            batch_loss += loss
+                            detached_memory = [memory[0].detach(),
+                                               memory[1].detach(),
+                                               memory[2].detach(),
+                                               (memory[3][0].detach(), memory[3][1].detach())]
+                            if (inds[x]+i+1)<128:
+                                exps.memory[inds[x] + i + 1] = detached_memory
                     else:
-                        dist, value = self.acmodel(sb.obs)
-
-                    entropy = dist.entropy().mean()
-
-                    ratio = torch.exp(dist.log_prob(sb.action) - sb.log_prob)
-                    surr1 = ratio * sb.advantage
-                    surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * sb.advantage
-                    policy_loss = -torch.min(surr1, surr2).mean()
-
-                    value_clipped = sb.value + torch.clamp(value - sb.value, -self.clip_eps, self.clip_eps)
-                    surr1 = (value - sb.returnn).pow(2)
-                    surr2 = (value_clipped - sb.returnn).pow(2)
-                    value_loss = torch.max(surr1, surr2).mean()
-
-                    loss = policy_loss - self.entropy_coef * entropy + self.value_loss_coef * value_loss
-
-                    # Update batch values
-
-                    batch_entropy += entropy.item()
-                    batch_value += value.mean().item()
-                    batch_policy_loss += policy_loss.item()
-                    batch_value_loss += value_loss.item()
-                    batch_loss += loss
-
-                    # Update memories for next epoch
-
-                    if self.acmodel.recurrent and i < self.recurrence - 1:
-                        if not self.acmodel.use_dnc_memory:
-                            exps.memory[inds + i + 1] = memory.detach()
+                        if self.acmodel.recurrent:
+                            if self.acmodel.use_dnc_memory:
+                                dist, value, memory = self.acmodel(sb.obs, memory)
+                            else:
+                                dist, value, memory = self.acmodel(sb.obs, memory * sb.mask)
                         else:
-                            inner_hiddens = []
-                            for j in range(len(memory[0])):
-                                inner_hiddens.append(torch.stack(memory[0][j]))
-                            controller_hiddens = torch.stack(inner_hiddens)
-                            for k in range(len(inds)):
-                                new_memory = {}
-                                for key in memory[1]:
-                                    new_memory[key] = memory[1][key][k].detach()
-                                new_read_vectors = memory[2][k].detach()
+                            dist, value = self.acmodel(sb.obs)
 
-                                exps.memory[inds[k] + i + 1] = (controller_hiddens[:,:,:,k:k+1,:].detach(),
-                                                                         new_memory,
-                                                                         new_read_vectors)
+                        entropy = dist.entropy().mean()
+
+                        ratio = torch.exp(dist.log_prob(sb.action) - sb.log_prob)
+                        surr1 = ratio * sb.advantage
+                        surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * sb.advantage
+                        policy_loss = -torch.min(surr1, surr2).mean()
+
+                        value_clipped = sb.value + torch.clamp(value - sb.value, -self.clip_eps, self.clip_eps)
+                        surr1 = (value - sb.returnn).pow(2)
+                        surr2 = (value_clipped - sb.returnn).pow(2)
+                        value_loss = torch.max(surr1, surr2).mean()
+
+                        loss = policy_loss - self.entropy_coef * entropy + self.value_loss_coef * value_loss
+
+                        # Update batch values
+
+                        batch_entropy += entropy.item()
+                        batch_value += value.mean().item()
+                        batch_policy_loss += policy_loss.item()
+                        batch_value_loss += value_loss.item()
+                        batch_loss += loss
+
+                        # Update memories for next epoch
+
+                        if self.acmodel.recurrent and i < self.recurrence - 1:
+                            if not self.acmodel.use_dnc_memory:
+                                exps.memory[inds + i + 1] = memory.detach()
+                            else:
+                                inner_hiddens = []
+                                for j in range(len(memory[0])):
+                                    inner_hiddens.append(torch.stack(memory[0][j]))
+                                controller_hiddens = torch.stack(inner_hiddens)
+                                for k in range(len(inds)):
+                                    new_memory = {}
+                                    for key in memory[1]:
+                                        new_memory[key] = memory[1][key][k].detach()
+                                    new_read_vectors = memory[2][k].detach()
+
+                                    exps.memory[inds[k] + i + 1] = (controller_hiddens[:,:,:,k:k+1,:].detach(),
+                                                                             new_memory,
+                                                                             new_read_vectors)
 
                 # Update batch values
 
@@ -130,7 +161,7 @@ class PPOAlgo(BaseAlgo):
 
                 self.optimizer.zero_grad()
                 batch_loss.backward()
-                grad_norm = sum(p.grad.data.norm(2).item() ** 2 for p in self.acmodel.parameters()) ** 0.5
+                grad_norm = sum([p.grad.data.norm(2).item() ** 2 for p in self.acmodel.parameters() if p.grad is not None]) ** 0.5
                 torch.nn.utils.clip_grad_norm_(self.acmodel.parameters(), self.max_grad_norm)
                 self.optimizer.step()
 
@@ -140,7 +171,7 @@ class PPOAlgo(BaseAlgo):
                 log_values.append(batch_value)
                 log_policy_losses.append(batch_policy_loss)
                 log_value_losses.append(batch_value_loss)
-                log_grad_norms.append(grad_norm)
+                #log_grad_norms.append(grad_norm)
 
         # Log some values
 
